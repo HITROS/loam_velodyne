@@ -1,35 +1,6 @@
-// Copyright 2013, Ji Zhang, Carnegie Mellon University
-// Further contributions copyright (c) 2016, Southwest Research Institute
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-//    this list of conditions and the following disclaimer.
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-//    this list of conditions and the following disclaimer in the documentation
-//    and/or other materials provided with the distribution.
-// 3. Neither the name of the copyright holder nor the names of its
-//    contributors may be used to endorse or promote products derived from this
-//    software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-// POSSIBILITY OF SUCH DAMAGE.
-//
-// This is an implementation of the algorithm described in the following paper:
-//   J. Zhang and S. Singh. LOAM: Lidar Odometry and Mapping in Real-time.
-//     Robotics: Science and Systems Conference (RSS). Berkeley, CA, July 2014.
-
+//LaserOdometry这一模块的主要功能是进行点云数据配准，完成运动估计
+//利用ScanRegisttration这能够提取到的特征点，建立相邻时间点云数据之间的关联，
+//由此判断出lidar的运动。
 #include <cmath>
 
 #include <loam_velodyne/common.h>
@@ -359,6 +330,7 @@ int main(int argc, char** argv)
   ros::init(argc, argv, "laserOdometry");
   ros::NodeHandle nh;
 
+  //订阅6个节点，通过回调函数进行处理
   ros::Subscriber subCornerPointsSharp = nh.subscribe<sensor_msgs::PointCloud2>
                                          ("/laser_cloud_sharp", 2, laserCloudSharpHandler);
 
@@ -377,6 +349,7 @@ int main(int argc, char** argv)
   ros::Subscriber subImuTrans = nh.subscribe<sensor_msgs::PointCloud2> 
                                 ("/imu_trans", 5, imuTransHandler);
 
+//发布4个节点
   ros::Publisher pubLaserCloudCornerLast = nh.advertise<sensor_msgs::PointCloud2>
                                            ("/laser_cloud_corner_last", 2);
 
@@ -387,11 +360,14 @@ int main(int argc, char** argv)
                                         ("/velodyne_cloud_3", 2);
 
   ros::Publisher pubLaserOdometry = nh.advertise<nav_msgs::Odometry> ("/laser_odom_to_init", 5);
+  //创建对象
   nav_msgs::Odometry laserOdometry;
   laserOdometry.header.frame_id = "/camera_init";
   laserOdometry.child_frame_id = "/laser_odom";
 
+  //创建TransforBroadcaster对象
   tf::TransformBroadcaster tfBroadcaster;
+  //创建坐标变换对象
   tf::StampedTransform laserOdometryTrans;
   laserOdometryTrans.frame_id_ = "/camera_init";
   laserOdometryTrans.child_frame_id_ = "/laser_odom";
@@ -405,6 +381,8 @@ int main(int argc, char** argv)
   cv::Mat matP(6, 6, CV_32F, cv::Scalar::all(0));
 
   int frameCount = skipFrameNum;
+  
+///接下来是设置处理速度并进行初始化
   ros::Rate rate(100);
   bool status = ros::ok();
   while (status) {
@@ -425,6 +403,7 @@ int main(int argc, char** argv)
       newImuTrans = false;
 
       if (!systemInited) {
+		  //保存上一时刻的速度
         pcl::PointCloud<PointType>::Ptr laserCloudTemp = cornerPointsLessSharp;
         cornerPointsLessSharp = laserCloudCornerLast;
         laserCloudCornerLast = laserCloudTemp;
@@ -433,58 +412,81 @@ int main(int argc, char** argv)
         surfPointsLessFlat = laserCloudSurfLast;
         laserCloudSurfLast = laserCloudTemp;
 
+		//kd二叉树 为了方便寻找最近的点
         kdtreeCornerLast->setInputCloud(laserCloudCornerLast);
         kdtreeSurfLast->setInputCloud(laserCloudSurfLast);
 
+		//发布Lasercloudcornerlast上一时刻
         sensor_msgs::PointCloud2 laserCloudCornerLast2;
         pcl::toROSMsg(*laserCloudCornerLast, laserCloudCornerLast2);
         laserCloudCornerLast2.header.stamp = ros::Time().fromSec(timeSurfPointsLessFlat);
         laserCloudCornerLast2.header.frame_id = "/camera";
         pubLaserCloudCornerLast.publish(laserCloudCornerLast2);
 
+		//发布Lasercloudsurflast上一时刻
         sensor_msgs::PointCloud2 laserCloudSurfLast2;
         pcl::toROSMsg(*laserCloudSurfLast, laserCloudSurfLast2);
         laserCloudSurfLast2.header.stamp = ros::Time().fromSec(timeSurfPointsLessFlat);
         laserCloudSurfLast2.header.frame_id = "/camera";
         pubLaserCloudSurfLast.publish(laserCloudSurfLast2);
 
+		//transformsum累计变换了角度
         transformSum[0] += imuPitchStart;
         transformSum[2] += imuRollStart;
 
         systemInited = true;
-        continue;
+        continue;//初始化后开始接受下一时刻的订阅数据
       }
 
       laserCloudOri->clear();
       coeffSel->clear();
 
+	  //更改位姿中的坐标
       transform[3] -= imuVeloFromStartX * scanPeriod;
       transform[4] -= imuVeloFromStartY * scanPeriod;
       transform[5] -= imuVeloFromStartZ * scanPeriod;
 
+///首先看分子：b和c叉乘，得到平面法向量设为h。即要求a和h的点乘的模。等于|a||h|cosα。再看分母：b和c叉乘的模，即法向量h的模|h|。因此，
+///分子除以分母即为a在h上投影的长度|a|cosα，也就是a到平面的距离。
+///理解了原理，我们来看这一部分的代码
+
+//特征点的数量足够多的再开始匹配，cornerPointsSharpNum和cornerPointsSharp都是最新时刻t+1的数据
       if (laserCloudCornerLastNum > 10 && laserCloudSurfLastNum > 100) {
         std::vector<int> indices;
         pcl::removeNaNFromPointCloud(*cornerPointsSharp,*cornerPointsSharp, indices);
         int cornerPointsSharpNum = cornerPointsSharp->points.size();
         int surfPointsFlatNum = surfPointsFlat->points.size();
+		//多次跌送，LM求解前后时刻的位姿变化
         for (int iterCount = 0; iterCount < 25; iterCount++) {
+			//特征角点的处理
           for (int i = 0; i < cornerPointsSharpNum; i++) {
+			// 每一次迭代都将特征点都要利用当前预测的坐标转换转换至k+1 sweep的初始位置处对应于函数 TransformToStart()
+            // 每一次迭代都将特征点都要利用当前预测的坐标转换转换至k+1 sweep的结束位置处对应于函数 TransformToEnd()
+            // pointSel是当前时刻t+1的cornerPointsSharp转换到初始imu坐标系后的点坐标，对角点一个一个做处理，设为i点
             TransformToStart(&cornerPointsSharp->points[i], &pointSel);
 
+			//每5次循环寻找一个邻域点，否则沿用上次循环的邻域点
             if (iterCount % 5 == 0) {
               std::vector<int> indices;
               pcl::removeNaNFromPointCloud(*laserCloudCornerLast,*laserCloudCornerLast, indices);
  
+ 
+              // nearestKSearch是PCL中的K近邻域搜索，搜索上一时刻LessCornor的K邻域点
+              // 搜索结果: pointSearchInd是索引; pointSearchSqDis是近邻对应的平方距离(以25作为阈值)
               kdtreeCornerLast->nearestKSearch(pointSel, 1, pointSearchInd, pointSearchSqDis);
 
+			  //在上一时刻t的lesssharp中用KD树寻找和点i最近的点j
               int closestPointInd = -1, minPointInd2 = -1;
               if (pointSearchSqDis[0] < 25) {
                 closestPointInd = pointSearchInd[0];
+				//最近邻域点的所在层数
                 int closestPointScan = int(laserCloudCornerLast->points[closestPointInd].intensity);
 
+				//在上一个时刻t的lesssharp中点j的附近2层中最近的点l
                 float pointSqDis, minPointSqDis2 = 25;
                 for (int j = closestPointInd + 1; j < cornerPointsSharpNum; j++) {
-                  if (int(laserCloudCornerLast->points[j].intensity) > closestPointScan + 2.5) {
+                  //closespointscan +(-) 2.5 表示只接受前后2层（共四层）范围内的数据
+				  if (int(laserCloudCornerLast->points[j].intensity) > closestPointScan + 2.5) {
                     break;
                   }
 
@@ -526,7 +528,7 @@ int main(int argc, char** argv)
               pointSearchCornerInd1[i] = closestPointInd;
               pointSearchCornerInd2[i] = minPointInd2;
             }
-
+///计算点i到jl的距离 理想情况下ijl共线
             if (pointSearchCornerInd2[i] >= 0) {
               tripod1 = laserCloudCornerLast->points[pointSearchCornerInd1[i]];
               tripod2 = laserCloudCornerLast->points[pointSearchCornerInd2[i]];
@@ -541,6 +543,7 @@ int main(int argc, char** argv)
               float y2 = tripod2.y;
               float z2 = tripod2.z;
 
+			  //公式分子
               float a012 = sqrt(((x0 - x1)*(y0 - y2) - (x0 - x2)*(y0 - y1))
                          * ((x0 - x1)*(y0 - y2) - (x0 - x2)*(y0 - y1)) 
                          + ((x0 - x1)*(z0 - z2) - (x0 - x2)*(z0 - z1))
@@ -548,8 +551,10 @@ int main(int argc, char** argv)
                          + ((y0 - y1)*(z0 - z2) - (y0 - y2)*(z0 - z1))
                          * ((y0 - y1)*(z0 - z2) - (y0 - y2)*(z0 - z1)));
 
+			  //公式分母
               float l12 = sqrt((x1 - x2)*(x1 - x2) + (y1 - y2)*(y1 - y2) + (z1 - z2)*(z1 - z2));
 
+			  //对xyz的偏导
               float la = ((y1 - y2)*((x0 - x1)*(y0 - y2) - (x0 - x2)*(y0 - y1)) 
                        + (z1 - z2)*((x0 - x1)*(z0 - z2) - (x0 - x2)*(z0 - z1))) / a012 / l12;
 
@@ -568,7 +573,7 @@ int main(int argc, char** argv)
 
               float s = 1;
               if (iterCount >= 5) {
-                s = 1 - 1.8 * fabs(ld2);
+                s = 1 - 1.8 * fabs(ld2);  //增加权重 距离越远 影响因子越小
               }
 
               coeff.x = s * la;
@@ -583,17 +588,21 @@ int main(int argc, char** argv)
             }
           }
 
+		  //特征平面点的处理
           for (int i = 0; i < surfPointsFlatNum; i++) {
+			//当前时刻t+1转换到imu初始坐标系下，对平面点一个一个做处理，设为点i
             TransformToStart(&surfPointsFlat->points[i], &pointSel);
 
             if (iterCount % 5 == 0) {
               kdtreeSurfLast->nearestKSearch(pointSel, 1, pointSearchInd, pointSearchSqDis);
 
               int closestPointInd = -1, minPointInd2 = -1, minPointInd3 = -1;
-              if (pointSearchSqDis[0] < 25) {
+              //上一时刻t的LessFlat中的距离点i最近的点j
+			  if (pointSearchSqDis[0] < 25) {
                 closestPointInd = pointSearchInd[0];
                 int closestPointScan = int(laserCloudSurfLast->points[closestPointInd].intensity);
 
+				//在附近4层寻找距离点j最近的两点l,m
                 float pointSqDis, minPointSqDis2 = 25, minPointSqDis3 = 25;
                 for (int j = closestPointInd + 1; j < surfPointsFlatNum; j++) {
                   if (int(laserCloudSurfLast->points[j].intensity) > closestPointScan + 2.5) {
@@ -650,11 +659,14 @@ int main(int argc, char** argv)
               pointSearchSurfInd3[i] = minPointInd3;
             }
 
+			//计算点i到平面jlm的距离dh 理想情况下ijlm共面
             if (pointSearchSurfInd2[i] >= 0 && pointSearchSurfInd3[i] >= 0) {
               tripod1 = laserCloudSurfLast->points[pointSearchSurfInd1[i]];
               tripod2 = laserCloudSurfLast->points[pointSearchSurfInd2[i]];
               tripod3 = laserCloudSurfLast->points[pointSearchSurfInd3[i]];
-
+              
+			  // pa,pb,pc既为偏导函数的分子部分也为距离函数分母行列式内各方向分量值，ps为分母部分
+			  
               float pa = (tripod2.y - tripod1.y) * (tripod3.z - tripod1.z) 
                        - (tripod3.y - tripod1.y) * (tripod2.z - tripod1.z);
               float pb = (tripod2.z - tripod1.z) * (tripod3.x - tripod1.x) 
@@ -669,8 +681,10 @@ int main(int argc, char** argv)
               pc /= ps;
               pd /= ps;
 
+			  //距离没有取绝对值
               float pd2 = pa * pointSel.x + pb * pointSel.y + pc * pointSel.z + pd;
 
+			  // 平面偏导公式，似乎后面没有用到
               pointProj = pointSel;
               pointProj.x -= pa * pd2;
               pointProj.y -= pb * pd2;
@@ -694,6 +708,7 @@ int main(int argc, char** argv)
             }
           }
 
+		  // 如果点云数量小于10，可以不用计算位姿矩阵了
           int pointSelNum = laserCloudOri->points.size();
           if (pointSelNum < 10) {
             continue;
@@ -705,6 +720,8 @@ int main(int argc, char** argv)
           cv::Mat matB(pointSelNum, 1, CV_32F, cv::Scalar::all(0));
           cv::Mat matAtB(6, 1, CV_32F, cv::Scalar::all(0));
           cv::Mat matX(6, 1, CV_32F, cv::Scalar::all(0));
+		  
+		  //构建雅可比矩阵，求解
           for (int i = 0; i < pointSelNum; i++) {
             pointOri = laserCloudOri->points[i];
             coeff = coeffSel->points[i];
@@ -721,6 +738,7 @@ int main(int argc, char** argv)
             float ty = s * transform[4];
             float tz = s * transform[5];
 
+			// J对rx,ry,rz,tx,ty,tz求解偏导
             float arx = (-s*crx*sry*srz*pointOri.x + s*crx*crz*sry*pointOri.y + s*srx*sry*pointOri.z 
                       + s*tx*crx*sry*srz - s*ty*crx*crz*sry - s*tz*srx*sry) * coeff.x
                       + (s*srx*srz*pointOri.x - s*crz*srx*pointOri.y + s*crx*pointOri.z
@@ -754,6 +772,8 @@ int main(int argc, char** argv)
 
             float d2 = coeff.intensity;
 
+			// A=[J的偏导]; B=[权重系数*(点到直线的距离/点到平面的距离)] 求解公式: AX=B
+            // 为了让左边满秩，同乘At-> At*A*X = At*B
             matA.at<float>(i, 0) = arx;
             matA.at<float>(i, 1) = ary;
             matA.at<float>(i, 2) = arz;
@@ -766,13 +786,14 @@ int main(int argc, char** argv)
           matAtA = matAt * matA;
           matAtB = matAt * matB;
           cv::solve(matAtA, matAtB, matX, cv::DECOMP_QR);
-
+          
+		  //接下来有一个迭代第一步的处理，猜测是出现退化进行修正。然后更新位姿之后进行收敛判断
           if (iterCount == 0) {
             cv::Mat matE(1, 6, CV_32F, cv::Scalar::all(0));
             cv::Mat matV(6, 6, CV_32F, cv::Scalar::all(0));
             cv::Mat matV2(6, 6, CV_32F, cv::Scalar::all(0));
 
-            cv::eigen(matAtA, matE, matV);
+            cv::eigen(matAtA, matE, matV);//计算矩阵的特征向量E及特征想来向量的反对称帧V
             matV.copyTo(matV2);
 
             isDegenerate = false;
@@ -782,7 +803,7 @@ int main(int argc, char** argv)
                 for (int j = 0; j < 6; j++) {
                   matV2.at<float>(i, j) = 0;
                 }
-                isDegenerate = true;
+                isDegenerate = true;//存在比10小的特征值则出现退化
               } else {
                 break;
               }
@@ -827,10 +848,14 @@ int main(int argc, char** argv)
         }
       }
 
+	  //坐标转换
       float rx, ry, rz, tx, ty, tz;
+	  //旋转角的累计变化量
+	  //AccumulateRotation作用将局部旋转坐标转换至全局旋转坐标
       AccumulateRotation(transformSum[0], transformSum[1], transformSum[2], 
                          -transform[0], -transform[1] * 1.05, -transform[2], rx, ry, rz);
 
+      //接着转移到世界坐标系下
       float x1 = cos(rz) * (transform[3] - imuShiftFromStartX) 
                - sin(rz) * (transform[4] - imuShiftFromStartY);
       float y1 = sin(rz) * (transform[3] - imuShiftFromStartX) 
@@ -845,6 +870,7 @@ int main(int argc, char** argv)
       ty = transformSum[4] - y2;
       tz = transformSum[5] - (-sin(ry) * x2 + cos(ry) * z2);
 
+	  //插入imu旋转，更新位姿
       PluginIMURotation(rx, ry, rz, imuPitchStart, imuYawStart, imuRollStart, 
                         imuPitchLast, imuYawLast, imuRollLast, rx, ry, rz);
 
@@ -855,6 +881,7 @@ int main(int argc, char** argv)
       transformSum[4] = ty;
       transformSum[5] = tz;
 
+	  //rx ry rz 转化为四元数组发布
       geometry_msgs::Quaternion geoQuat = tf::createQuaternionMsgFromRollPitchYaw(rz, -rx, -ry);
 
       laserOdometry.header.stamp = ros::Time().fromSec(timeSurfPointsLessFlat);
@@ -867,11 +894,13 @@ int main(int argc, char** argv)
       laserOdometry.pose.pose.position.z = tz;
       pubLaserOdometry.publish(laserOdometry);
 
+	  //laserOdometryTrans 是用于tf广播
       laserOdometryTrans.stamp_ = ros::Time().fromSec(timeSurfPointsLessFlat);
       laserOdometryTrans.setRotation(tf::Quaternion(-geoQuat.y, -geoQuat.z, geoQuat.x, geoQuat.w));
       laserOdometryTrans.setOrigin(tf::Vector3(tx, ty, tz));
       tfBroadcaster.sendTransform(laserOdometryTrans);
 
+	  //TransformToEnd的作用是将k+1时刻的less特征点转移至k+1时刻的sweep的结束位置处的雷达坐标系下
       int cornerPointsLessSharpNum = cornerPointsLessSharp->points.size();
       for (int i = 0; i < cornerPointsLessSharpNum; i++) {
         TransformToEnd(&cornerPointsLessSharp->points[i], &cornerPointsLessSharp->points[i]);
@@ -890,6 +919,7 @@ int main(int argc, char** argv)
         }
       }
 
+	  //在t+1时刻数据成为上一时刻的数据
       pcl::PointCloud<PointType>::Ptr laserCloudTemp = cornerPointsLessSharp;
       cornerPointsLessSharp = laserCloudCornerLast;
       laserCloudCornerLast = laserCloudTemp;
@@ -907,6 +937,7 @@ int main(int argc, char** argv)
 
       }
 
+	  //2HZ发布一次？？？
       if (frameCount >= skipFrameNum + 1) {
         frameCount = 0;
 
