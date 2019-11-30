@@ -1,35 +1,3 @@
-// Copyright 2013, Ji Zhang, Carnegie Mellon University
-// Further contributions copyright (c) 2016, Southwest Research Institute
-// All rights reserved.
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met:
-//
-// 1. Redistributions of source code must retain the above copyright notice,
-//    this list of conditions and the following disclaimer.
-// 2. Redistributions in binary form must reproduce the above copyright notice,
-//    this list of conditions and the following disclaimer in the documentation
-//    and/or other materials provided with the distribution.
-// 3. Neither the name of the copyright holder nor the names of its
-//    contributors may be used to endorse or promote products derived from this
-//    software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
-// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
-// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-// POSSIBILITY OF SUCH DAMAGE.
-//
-// This is an implementation of the algorithm described in the following paper:
-//   J. Zhang and S. Singh. LOAM: Lidar Odometry and Mapping in Real-time.
-//     Robotics: Science and Systems Conference (RSS). Berkeley, CA, July 2014.
-
 #include <cmath>
 
 #include <loam_velodyne/common.h>
@@ -147,6 +115,7 @@ void transformAssociateToMap()
 void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr& laserOdometry)
 {
   double roll, pitch, yaw;
+  //对接收到的消息进行解析，得到transformsum
   geometry_msgs::Quaternion geoQuat = laserOdometry->pose.pose.orientation;
   tf::Matrix3x3(tf::Quaternion(geoQuat.z, -geoQuat.x, -geoQuat.y, geoQuat.w)).getRPY(roll, pitch, yaw);
 
@@ -158,8 +127,10 @@ void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr& laserOdometry)
   transformSum[4] = laserOdometry->pose.pose.position.y;
   transformSum[5] = laserOdometry->pose.pose.position.z;
 
+//位姿更新
   transformAssociateToMap();
 
+//位姿信息进行储存，准备发布
   geoQuat = tf::createQuaternionMsgFromRollPitchYaw
             (transformMapped[2], -transformMapped[0], -transformMapped[1]);
 
@@ -179,12 +150,22 @@ void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr& laserOdometry)
   tfBroadcaster2Pointer->sendTransform(laserOdometryTrans2);
 }
 
+///但是，这里还是有个小坑的。这个节点接收了两个消息，分别是laserOdometry节点
+///和laserMapping节点发布的，而这两个节点发布的频率不同，那么是怎么处理的呢？
+
 void odomAftMappedHandler(const nav_msgs::Odometry::ConstPtr& odomAftMapped)
 {
   double roll, pitch, yaw;
   geometry_msgs::Quaternion geoQuat = odomAftMapped->pose.pose.orientation;
   tf::Matrix3x3(tf::Quaternion(geoQuat.z, -geoQuat.x, -geoQuat.y, geoQuat.w)).getRPY(roll, pitch, yaw);
 
+//也是很简单的解析函数，作用是在接收了LaserMapping的消息后更新位姿
+//注意这里是LaserMapping发布的是优化过后的位姿，看到这里就逐渐能明白
+//当接收到LaserMapping后立即更新位姿，这样就得到了优化后的结果
+//而这一优化结果会被LaserOdometryHandler里的TransformAssociateToMap拿来建图
+//一直等到下一次接收到LaserMapping的消息，再一次更新位姿
+//也就是说，最后采用的位姿是TransformMaintenance发布的integrated_to_init消息。而且由上面的分析可知，TransformMaintenance
+//的发布频率和laserOdometry的发布频率是一致的。
   transformAftMapped[0] = -pitch;
   transformAftMapped[1] = -yaw;
   transformAftMapped[2] = roll;
@@ -207,12 +188,14 @@ int main(int argc, char** argv)
   ros::init(argc, argv, "transformMaintenance");
   ros::NodeHandle nh;
 
+  //订阅了两个节点
   ros::Subscriber subLaserOdometry = nh.subscribe<nav_msgs::Odometry> 
                                      ("/laser_odom_to_init", 5, laserOdometryHandler);
 
   ros::Subscriber subOdomAftMapped = nh.subscribe<nav_msgs::Odometry> 
                                      ("/aft_mapped_to_init", 5, odomAftMappedHandler);
 
+  //发布一个节点
   ros::Publisher pubLaserOdometry2 = nh.advertise<nav_msgs::Odometry> ("/integrated_to_init", 5);
   pubLaserOdometry2Pointer = &pubLaserOdometry2;
   laserOdometry2.header.frame_id = "/camera_init";
